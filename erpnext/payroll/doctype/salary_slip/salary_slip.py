@@ -7,6 +7,7 @@ import datetime
 import math
 
 import frappe
+from frappe.utils import logger
 from frappe import _, msgprint
 from frappe.model.naming import make_autoname
 from frappe.utils import (
@@ -737,25 +738,84 @@ class SalarySlip(TransactionBase):
 			self.deduct_tax_for_unclaimed_employee_benefits = 1
 
 		return self.calculate_variable_tax(payroll_period, tax_component)
+	
+	def create_log(self):
+		log = logger.get_logger(module='HR', max_size=900_000, file_count=20)
+		log.setLevel(level='INFO')
+		fields_to_log = ['employee', 'posting_date', 'company', 
+						'employee_name', 'start_date', 'end_date', 'payroll_frequency',
+						'salary_structure', 'total_working_days', 'payment_days', 'absent_days', 'leave_without_pay',
+						'deduct_tax_for_unclaimed_employee_benefits', 'deduct_tax_for_unsubmitted_tax_exemption_proof',
+						]
+		data_string = '\n '
+		for key, value in self.get().items():
+			if key in fields_to_log:
+				data_string += f"{key}: {value}\n"
+		log.info(data_string)		
+		
+		log.info("\n\n\n")
+		log.info('EARNINGS')
+		data_string = '\n '
+		if self.earnings:
+			for row in self.earnings:
+				data_string += f'Component: {row.salary_component}\n Amount:{row.amount}\n statistical componenent"{row.statistical_component}\
+					\n Depends on payent days: {row.depends_on_payment_days}\n Is Tax Applicable:{row.is_tax_applicable}\
+					\n Do not include in total: {row.do_not_include_in_total} \n'
+		log.info(data_string)
+		
+		log.info("\n\n\n")
+		log.info('Deductions')
+		data_string = '\n '
+		if self.deductions:
+			for row in self.deductions:
+				data_string += f'Component: {row.salary_component}\n Amount:{row.amount}\n statistical componenent:{row.statistical_component}\
+					\n Depends on payent days: {row.depends_on_payment_days}\n Exempted from income tax:{row.exempted_from_income_tax}\
+					\n Do not include in total: {row.do_not_include_in_total} \n'
+		log.info(data_string)
+		
+		log.info(f'Gross Pay: {self.gross_pay}')
+		log.info(f'Total Deductions: {self.total_deduction}')
+		log.info(f'Net Pay: {self.net_pay}')
+		return log
+	
+	def log_tax_slab(self, log, tax_slab):
+		fields_to_log = ['name', 'effective_from', 'company', 'standard_tax_exemption_amount']
+		for key, value in tax_slab.get().items():
+			if key in fields_to_log:
+				log.info(f"{key}:{value}")
+		
+		if tax_slab.slabs:
+			log.info("\nTAX SLABS")
+			data_string = '\n'
+			for slab in tax_slab.slabs:
+				data_string += f'From Amount: {slab.from_amount} \n To Amount: {slab.to_amount}\n Percent Deduction: {slab.percent_deduction}\n'
+			log.info(data_string)
+				
 
 	def calculate_variable_tax(self, payroll_period, tax_component):
+		log = self.create_log()
 		# get Tax slab from salary structure assignment for the employee and payroll period
 		tax_slab = self.get_income_tax_slabs(payroll_period)
+		self.log_tax_slab(log, tax_slab)
 
 		# get remaining numbers of sub-period (period for which one salary is processed)
-		remaining_sub_periods = get_period_factor(self.employee,
-			self.start_date, self.end_date, self.payroll_frequency, payroll_period)[1]
+		remaining_sub_periods = get_period_factor(self.employee, self.start_date, self.end_date, self.payroll_frequency, payroll_period)[1]
+		log.info(f'Remaning Sub Periods: {remaining_sub_periods}')
+
 		# get taxable_earnings, paid_taxes for previous period
-		previous_taxable_earnings = self.get_taxable_earnings_for_prev_period(payroll_period.start_date,
-			self.start_date, tax_slab.allow_tax_exemption)
+		previous_taxable_earnings = self.get_taxable_earnings_for_prev_period(payroll_period.start_date,self.start_date, tax_slab.allow_tax_exemption)
 		previous_total_paid_taxes = self.get_tax_paid_in_period(payroll_period.start_date, self.start_date, tax_component)
+		log.info(f'Previous Taxable Earnings: {previous_taxable_earnings}   NOTE: Based on payroll start date, salary slip start date and tax slab allow tax exemption')
+		log.info(f'Previous Total Paid Taxes: {previous_total_paid_taxes}   NOTE: Based on payroll start date, salary slip start data, and tax component ')
 
 		# get taxable_earnings for current period (all days)
-		current_taxable_earnings = self.get_taxable_earnings(tax_slab.allow_tax_exemption)
+		current_taxable_earnings = self.get_taxable_earnings(log, tax_slab.allow_tax_exemption)
 		future_structured_taxable_earnings = current_taxable_earnings.taxable_earnings * (math.ceil(remaining_sub_periods) - 1)
+		log.info(f'Future structured taxable earnings: {future_structured_taxable_earnings}')
 
 		# get taxable_earnings, addition_earnings for current actual payment days
-		current_taxable_earnings_for_payment_days = self.get_taxable_earnings(tax_slab.allow_tax_exemption, based_on_payment_days=1)
+		current_taxable_earnings_for_payment_days = self.get_taxable_earnings(log, tax_slab.allow_tax_exemption, based_on_payment_days=1)
+
 		current_structured_taxable_earnings = current_taxable_earnings_for_payment_days.taxable_earnings
 		current_additional_earnings = current_taxable_earnings_for_payment_days.additional_income
 		current_additional_earnings_with_full_tax = current_taxable_earnings_for_payment_days.additional_income_with_full_tax
@@ -764,36 +824,43 @@ class SalarySlip(TransactionBase):
 		unclaimed_taxable_benefits = 0
 		if self.deduct_tax_for_unclaimed_employee_benefits:
 			unclaimed_taxable_benefits = self.calculate_unclaimed_taxable_benefits(payroll_period)
+			log.info(f'Unclaimed taxable benefits: {unclaimed_taxable_benefits}')
 			unclaimed_taxable_benefits += current_taxable_earnings_for_payment_days.flexi_benefits
+			log.info(f'Unclaimed taxable benefits with flexi benefits: {unclaimed_taxable_benefits}')
 
 		# Total exemption amount based on tax exemption declaration
 		total_exemption_amount = self.get_total_exemption_amount(payroll_period, tax_slab)
-
+		log.info(f'Total exemptiom amount: {total_exemption_amount}')
 		#Employee Other Incomes
 		other_incomes = self.get_income_form_other_sources(payroll_period) or 0.0
+		log.info(f'Other incomes: {other_incomes}')
 
 		# Total taxable earnings including additional and other incomes
+		log.info('total taxable earnigs including additinoal and other incomes')
 		total_taxable_earnings = previous_taxable_earnings + current_structured_taxable_earnings + future_structured_taxable_earnings \
 			+ current_additional_earnings + other_incomes + unclaimed_taxable_benefits - total_exemption_amount
-
+		log.info(f'Total taxable_earnings: {total_taxable_earnings} NOTE: Formula = previous_taxable_earnings + current_structured_taxable_earnings + future_structured_taxable_earnings + current_additional_earnings + other_incomes + unclaimed_taxable_benefits - total_exemption_amount')
 		# Total taxable earnings without additional earnings with full tax
 		total_taxable_earnings_without_full_tax_addl_components = total_taxable_earnings - current_additional_earnings_with_full_tax
-
+		log.info(f'Total taxable earnings without additional earnings with full tax: {total_taxable_earnings_without_full_tax_addl_components} NOTE: Formula = total_taxable_earnings - current_additional_earnings_with_full_tax')
 		# Structured tax amount
-		total_structured_tax_amount = self.calculate_tax_by_tax_slab(
-			total_taxable_earnings_without_full_tax_addl_components, tax_slab)
+		log.info('Structure tax amount, tax calcualted based on tax slab')
+		total_structured_tax_amount = self.calculate_tax_by_tax_slab(total_taxable_earnings_without_full_tax_addl_components, tax_slab)
+		log.info(f"Total Structured tax amount based on tax slab: {total_structured_tax_amount}")
 		current_structured_tax_amount = (total_structured_tax_amount - previous_total_paid_taxes) / remaining_sub_periods
-
+		log.info(f"current structed tax amount: {current_structured_tax_amount} NOTE: formula = (total_structured_tax_amount - previous_total_paid_taxes) / remaining_sub_periods")
 		# Total taxable earnings with additional earnings with full tax
+		log.info('Total taxable earnings with additional earnings with full tax')
 		full_tax_on_additional_earnings = 0.0
 		if current_additional_earnings_with_full_tax:
 			total_tax_amount = self.calculate_tax_by_tax_slab(total_taxable_earnings, tax_slab)
 			full_tax_on_additional_earnings = total_tax_amount - total_structured_tax_amount
+			log.info(f'Full tax on additional earnings: {full_tax_on_additional_earnings} NOTE: Formula=total_tax_amount - total_structured_tax_amount')
 
 		current_tax_amount = current_structured_tax_amount + full_tax_on_additional_earnings
 		if flt(current_tax_amount) < 0:
 			current_tax_amount = 0
-
+		log.info(f'Final tax amount: {current_tax_amount} NOTE: tax amount is set to 0 if the value is in negative')
 		return current_tax_amount
 
 	def get_income_tax_slabs(self, payroll_period):
@@ -881,14 +948,16 @@ class SalarySlip(TransactionBase):
 
 		return total_tax_paid
 
-	def get_taxable_earnings(self, allow_tax_exemption=False, based_on_payment_days=0):
-		joining_date, relieving_date = self.get_joining_and_relieving_dates()
+	def get_taxable_earnings(self, log, allow_tax_exemption=False, based_on_payment_days=0):
+		log.info("\n\nTAXABLE EARNINGS")
+		log.info('taxable_earnings for current period (all days)')
 
+		joining_date, relieving_date = self.get_joining_and_relieving_dates()
 		taxable_earnings = 0
 		additional_income = 0
 		additional_income_with_full_tax = 0
 		flexi_benefits = 0
-
+		log.info(f"Based on payment days: {based_on_payment_days}")
 		for earning in self.earnings:
 			if based_on_payment_days:
 				amount, additional_amount = self.get_amount_based_on_payment_days(earning, joining_date, relieving_date)
@@ -913,6 +982,11 @@ class SalarySlip(TransactionBase):
 					if earning.deduct_full_tax_on_selected_payroll_date:
 						additional_income_with_full_tax += additional_amount
 
+		log.info(f"Earnings amount: {amount} NOTE: includes are the earnings amount")
+		log.info(f"Earnings additional amount: {additional_amount}")
+		log.info(f"Taxable earnings: {taxable_earnings} NOTE: earnings amount - additional amount")
+		log.info(f"Additional Income: {additional_income}")
+		
 		if allow_tax_exemption:
 			for ded in self.deductions:
 				if ded.exempted_from_income_tax:
@@ -927,6 +1001,10 @@ class SalarySlip(TransactionBase):
 						additional_income -= self.get_future_recurring_additional_amount(ded.additional_salary,
 							ded.additional_amount) # Used ded.additional_amount to consider the amount for the full month
 
+		log.info(f"Taxable earnings after deductions: {taxable_earnings}")
+		log.info(f"additional income after deductions: {additional_income}")
+		log.info(f"additional_income_with_full_tax after deductions: {additional_income_with_full_tax}")
+		log.info(f"flexi_benefits after deductions: {flexi_benefits}")
 		return frappe._dict({
 			"taxable_earnings": taxable_earnings,
 			"additional_income": additional_income,
